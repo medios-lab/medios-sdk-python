@@ -125,6 +125,30 @@ def test_subscribe_sends_framework_info_with_current_user():
         assert first.subscribe.framework_info.name == "test-fw"
 
 
+def test_principal_is_sent_in_framework_info_and_header():
+    with FakeController() as fc:
+        client = Client(fc.url, "test-fw", principal="framework:test-fw")
+        events = client.subscribe()
+        fc.send_event(_subscribed("fw-001"))
+        next(events)
+        client.revive()
+
+        (sub_headers, sub), (call_headers, _) = fc.recorded()[:2]
+        assert sub.subscribe.framework_info.principal == "framework:test-fw"
+        for headers in (sub_headers, call_headers):
+            lower = {k.lower(): v for k, v in headers.items()}
+            assert lower.get("x-medios-principal") == "framework:test-fw"
+
+
+def test_no_principal_omits_field_and_header():
+    with FakeController() as fc:
+        client = Client(fc.url, "test-fw")
+        client.subscribe()
+        headers, sub = fc.recorded()[0]
+        assert sub.subscribe.framework_info.principal is None
+        assert "x-medios-principal" not in {k.lower() for k in headers}
+
+
 def test_accept_threads_stream_id_header():
     with FakeController() as fc:
         client = Client(fc.url, "test-fw")

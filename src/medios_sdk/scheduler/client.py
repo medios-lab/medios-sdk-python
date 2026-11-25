@@ -88,9 +88,16 @@ class Client:
         user: Optional[str] = None,
         framework_id: Optional[str] = None,
         failover_timeout: float = 0.0,
+        principal: Optional[str] = None,
         opener: Optional[urllib.request.OpenerDirector] = None,
     ) -> None:
         info = FrameworkInfo(user=user or getpass.getuser(), name=name)
+        # The framework identity goes in FrameworkInfo.principal (required on
+        # unauthenticated connections, medios#537) and in the
+        # X-Medios-Principal header on every call, as the Go SDK sends it.
+        self._principal = principal or ""
+        if self._principal:
+            info.principal = self._principal
         self._framework_id = ""
         if framework_id:
             # Re-subscribe under the persisted id, and pre-populate it so calls
@@ -124,7 +131,9 @@ class Client:
             self._url(),
             data=_to_json_bytes(call),
             method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=self._headers(
+                {"Content-Type": "application/json", "Accept": "application/json"}
+            ),
         )
         try:
             resp = self._opener.open(req)
@@ -202,6 +211,11 @@ class Client:
     def _url(self) -> str:
         return self._controller_url + _SCHEDULER_PATH
 
+    def _headers(self, headers: dict) -> dict:
+        if self._principal:
+            headers["X-Medios-Principal"] = self._principal
+        return headers
+
     def _post(self, call: Call) -> None:
         if not self._stream_id:
             raise SchedulerError(
@@ -211,10 +225,12 @@ class Client:
             self._url(),
             data=_to_json_bytes(call),
             method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Medios-Stream-Id": self._stream_id,
-            },
+            headers=self._headers(
+                {
+                    "Content-Type": "application/json",
+                    "Medios-Stream-Id": self._stream_id,
+                }
+            ),
         )
         try:
             resp = self._opener.open(req)

@@ -591,12 +591,17 @@ class FrameworkInfo(WireModel):
     ``failover_timeout`` is how long, in seconds, the controller keeps this
     framework's tasks alive after it disconnects; 0/None (the default) means
     tasks are killed the moment the framework disconnects.
+
+    ``principal`` is the framework's identity (for example
+    ``"framework:my-framework"``). The controller refuses SUBSCRIBE on an
+    unauthenticated connection when it is empty (medios#537).
     """
 
     user: str
     name: str
     id: Optional[ID] = None
     failover_timeout: Optional[float] = None
+    principal: Optional[str] = None
 
 
 # ===========================================================================
