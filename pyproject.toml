@@ -1,6 +1,6 @@
 [project]
 name = "medios-sdk"
-version = "0.5.0"
+version = "0.6.0"
 description = "Python client for the Medios HTTP v1 scheduler API"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -12,7 +12,7 @@ Top-level convenience: the wire types and TaskState live in
 from . import medios, sandbox, scheduler, store, timestamp
 from .scheduler import Client, SchedulerError
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "medios",
