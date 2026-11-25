@@ -6,6 +6,7 @@ writing RecordIO frames as the test queues events.
 
 import json
 import queue
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -289,6 +290,40 @@ def test_subscribe_skips_unreachable_and_leaderless_controllers():
             assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
     finally:
         leaderless.close()
+
+
+class _Dropper:
+    """Accepts each connection and closes it before sending a response."""
+
+    def __init__(self):
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            conn.recv(65536)
+            conn.close()
+
+    def close(self):
+        self._sock.close()
+
+
+def test_subscribe_skips_controller_that_drops_the_connection():
+    dropper = _Dropper()
+    try:
+        with FakeController() as fc:
+            client = Client([dropper.url, fc.url], "test-fw")
+            client.subscribe()
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+    finally:
+        dropper.close()
 
 
 def test_subscribe_reports_every_controller_when_none_accepts():

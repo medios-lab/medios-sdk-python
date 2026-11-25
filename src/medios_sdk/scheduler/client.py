@@ -17,6 +17,7 @@ Wire-protocol requirements baked into defaults:
 from __future__ import annotations
 
 import getpass
+import http.client
 import json
 import urllib.error
 import urllib.parse
@@ -183,6 +184,12 @@ class Client:
                     raise SchedulerError(f"SUBSCRIBE got HTTP {e.code}: {detail}") from e
                 except urllib.error.URLError as e:
                     errors.append(f"{endpoint}: {e.reason}")
+                    break
+                except (http.client.HTTPException, OSError) as e:
+                    # urllib wraps a failed connect in URLError, but a
+                    # connection closed or reset before the response headers
+                    # arrive is raised as it is.
+                    errors.append(f"{endpoint}: {type(e).__name__}: {e}")
                     break
 
                 self._endpoint = endpoint
