@@ -6,6 +6,7 @@ writing RecordIO frames as the test queues events.
 
 import json
 import queue
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -233,3 +234,172 @@ def test_stream_delivers_multiple_events_then_closes():
 def test_with_framework_id_prepopulates():
     client = Client("http://x:5150", "fw", framework_id="fw-prev", failover_timeout=60)
     assert client.framework_id == "fw-prev"
+
+
+class _Redirector:
+    """A standby controller: answers every POST with 307 to the leader, or 503."""
+
+    def __init__(self, location=None):
+        target = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                if target.location:
+                    self.send_response(307)
+                    self.send_header("Location", target.location)
+                else:
+                    self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.location = location
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def test_subscribe_follows_standby_redirect_and_posts_to_leader():
+    with FakeController() as fc:
+        # Scheme-relative, as the controller sends it.
+        standby = _Redirector("//127.0.0.1:%d/api/v1/scheduler" % fc.port)
+        try:
+            client = Client(standby.url, "test-fw")
+            events = client.subscribe()
+            fc.send_event(_subscribed("fw-001"))
+            next(events)
+            client.revive()
+            assert [c.type for _, c in fc.recorded()] == [m.CALL_SUBSCRIBE, m.CALL_REVIVE]
+        finally:
+            standby.close()
+
+
+def test_subscribe_skips_unreachable_and_leaderless_controllers():
+    leaderless = _Redirector(None)
+    try:
+        with FakeController() as fc:
+            client = Client(f"http://127.0.0.1:1,{leaderless.url},{fc.url}", "test-fw")
+            client.subscribe()
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+    finally:
+        leaderless.close()
+
+
+class _Dropper:
+    """Accepts each connection and closes it before sending a response."""
+
+    def __init__(self):
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            conn.recv(65536)
+            conn.close()
+
+    def close(self):
+        self._sock.close()
+
+
+def test_subscribe_skips_controller_that_drops_the_connection():
+    dropper = _Dropper()
+    try:
+        with FakeController() as fc:
+            client = Client([dropper.url, fc.url], "test-fw")
+            client.subscribe()
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+    finally:
+        dropper.close()
+
+
+def test_subscribe_reports_every_controller_when_none_accepts():
+    leaderless = _Redirector(None)
+    try:
+        client = Client(["http://127.0.0.1:1", leaderless.url], "test-fw")
+        with pytest.raises(SchedulerError) as exc:
+            client.subscribe()
+        assert "127.0.0.1:1" in str(exc.value) and "503" in str(exc.value)
+    finally:
+        leaderless.close()
+
+
+def test_resubscribe_reuses_assigned_framework_id():
+    with FakeController() as fc:
+        client = Client(fc.url, "test-fw")
+        events = client.subscribe()
+        fc.send_event(_subscribed("fw-001"))
+        next(events)
+        client.subscribe()
+        first, second = [c for _, c in fc.recorded() if c.type == m.CALL_SUBSCRIBE]
+        assert first.subscribe.framework_info.id is None
+        assert second.subscribe.framework_info.id.value == "fw-001"
+
+
+def test_empty_controller_url_is_refused():
+    with pytest.raises(ValueError):
+        Client(" , ", "test-fw")
+
+
+class _Truncator:
+    """Answers each request with a status line, a Content-Length of ten and one
+    body byte, then closes the connection."""
+
+    def __init__(self, status, location=None):
+        head = f"HTTP/1.1 {status} X\r\nContent-Length: 10\r\n"
+        if location:
+            head += f"Location: {location}\r\n"
+        self._reply = (head + "\r\nx").encode()
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            conn.recv(65536)
+            conn.sendall(self._reply)
+            conn.close()
+
+    def close(self):
+        self._sock.close()
+
+
+def test_subscribe_skips_controller_whose_503_body_is_truncated():
+    truncator = _Truncator(503)
+    try:
+        with FakeController() as fc:
+            client = Client([truncator.url, fc.url], "test-fw")
+            client.subscribe()
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+    finally:
+        truncator.close()
+
+
+def test_subscribe_follows_redirect_whose_body_is_truncated():
+    with FakeController() as fc:
+        truncator = _Truncator(307, "//127.0.0.1:%d/api/v1/scheduler" % fc.port)
+        try:
+            client = Client(truncator.url, "test-fw")
+            client.subscribe()
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+        finally:
+            truncator.close()

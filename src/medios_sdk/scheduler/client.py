@@ -17,10 +17,12 @@ Wire-protocol requirements baked into defaults:
 from __future__ import annotations
 
 import getpass
+import http.client
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Sequence, Union
 
 from ..medios import (
     EVENT_SUBSCRIBED,
@@ -44,6 +46,11 @@ from ..medios.store import validate_volumes
 from ..medios.types import ReconcileTask
 
 _SCHEDULER_PATH = "/api/v1/scheduler"
+
+# Parameter: redirects followed from one configured URL. A standby points
+# straight at the leader, so one hop is normal; more means leadership is
+# moving, and subscribe() moves on to the next URL instead of chasing it.
+_MAX_REDIRECTS = 3
 
 
 class SchedulerError(Exception):
@@ -78,11 +85,19 @@ class Client:
     (failover) and holds its tasks across the disconnect. After re-subscribing,
     call :meth:`reconcile` to re-learn task state; replies arrive as UPDATE
     events on the stream.
+
+    Controller failover: pass every controller's URL, as a list or one
+    comma-separated string. :meth:`subscribe` finds the leader: it follows a
+    standby's 307 redirect, and moves to the next URL when a controller is
+    unreachable or has no leader yet (HTTP 503). When the stream ends because
+    the leader went away, call :meth:`subscribe` again on the same client; it
+    resubscribes under the framework_id it was assigned, so with a non-zero
+    ``failover_timeout`` the framework's tasks keep running.
     """
 
     def __init__(
         self,
-        controller_url: str,
+        controller_url: Union[str, Sequence[str]],
         name: str,
         *,
         user: Optional[str] = None,
@@ -107,7 +122,16 @@ class Client:
         if failover_timeout and failover_timeout > 0:
             info.failover_timeout = failover_timeout
         self._framework_info = info
-        self._controller_url = controller_url.rstrip("/")
+        urls = (
+            controller_url.split(",")
+            if isinstance(controller_url, str)
+            else list(controller_url)
+        )
+        self._controller_urls = [u.strip().rstrip("/") for u in urls if u.strip()]
+        if not self._controller_urls:
+            raise ValueError("controller_url: at least one controller URL is required")
+        # The scheduler endpoint of the controller the open stream is on.
+        self._endpoint = ""
         self._stream_id = ""
         self._opener = opener or urllib.request.build_opener()
 
@@ -125,26 +149,63 @@ class Client:
         captured and follow-up calls are valid as soon as you start iterating.
         The framework_id is captured from the SUBSCRIBED event (the first one)
         before it is yielded.
-        """
-        call = new_subscribe_call(self._framework_info)
-        req = urllib.request.Request(
-            self._url(),
-            data=_to_json_bytes(call),
-            method="POST",
-            headers=self._headers(
-                {"Content-Type": "application/json", "Accept": "application/json"}
-            ),
-        )
-        try:
-            resp = self._opener.open(req)
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace").strip()
-            raise SchedulerError(f"SUBSCRIBE got HTTP {e.code}: {detail}") from e
-        except urllib.error.URLError as e:
-            raise SchedulerError(f"SUBSCRIBE request: {e.reason}") from e
 
-        self._stream_id = resp.headers.get("Medios-Stream-Id", "") or ""
-        return self._events(resp)
+        Controllers are tried in the order given. A 307 from a standby is
+        followed to the leader; an unreachable controller or a 503 (no leader
+        elected yet) moves on to the next URL. Any other HTTP error is raised
+        at once. When no controller accepts, :class:`SchedulerError` lists
+        what each one answered; the caller decides when to try again.
+        """
+        body = _to_json_bytes(new_subscribe_call(self._framework_info))
+        errors = []
+        for base in self._controller_urls:
+            endpoint = base + _SCHEDULER_PATH
+            for _ in range(_MAX_REDIRECTS + 1):
+                req = urllib.request.Request(
+                    endpoint,
+                    data=body,
+                    method="POST",
+                    headers=self._headers(
+                        {"Content-Type": "application/json", "Accept": "application/json"}
+                    ),
+                )
+                try:
+                    resp = self._opener.open(req)
+                except urllib.error.HTTPError as e:
+                    location = e.headers.get("Location") if e.code == 307 else None
+                    # The status and Location header decide what happens next;
+                    # the body is only detail for the error message, so a
+                    # body cut short must not change that decision.
+                    try:
+                        detail = e.read().decode("utf-8", "replace").strip()
+                    except (http.client.HTTPException, OSError) as read_error:
+                        detail = f"(body unreadable: {type(read_error).__name__})"
+                    finally:
+                        e.close()
+                    if location:
+                        endpoint = urllib.parse.urljoin(endpoint, location)
+                        continue
+                    if e.code == 503:
+                        errors.append(f"{endpoint}: HTTP 503: {detail}")
+                        break
+                    raise SchedulerError(f"SUBSCRIBE got HTTP {e.code}: {detail}") from e
+                except urllib.error.URLError as e:
+                    errors.append(f"{endpoint}: {e.reason}")
+                    break
+                except (http.client.HTTPException, OSError) as e:
+                    # urllib wraps a failed connect in URLError, but a
+                    # connection closed or reset before the response headers
+                    # arrive is raised as it is.
+                    errors.append(f"{endpoint}: {type(e).__name__}: {e}")
+                    break
+
+                self._endpoint = endpoint
+                self._stream_id = resp.headers.get("Medios-Stream-Id", "") or ""
+                return self._events(resp)
+            else:
+                errors.append(f"{base}: more than {_MAX_REDIRECTS} redirects")
+
+        raise SchedulerError("SUBSCRIBE: no controller accepted: " + "; ".join(errors))
 
     def _events(self, resp) -> Iterator[Event]:
         try:
@@ -152,6 +213,8 @@ class Client:
                 event = Event.model_validate_json(raw)
                 if event.type == EVENT_SUBSCRIBED and event.subscribed is not None:
                     self._framework_id = event.subscribed.framework_id.value
+                    # A later subscribe() is a failover of this framework.
+                    self._framework_info.id = ID(value=self._framework_id)
                 yield event
         finally:
             resp.close()
@@ -208,9 +271,6 @@ class Client:
 
     # ── Internals ──────────────────────────────────────────────────────────
 
-    def _url(self) -> str:
-        return self._controller_url + _SCHEDULER_PATH
-
     def _headers(self, headers: dict) -> dict:
         if self._principal:
             headers["X-Medios-Principal"] = self._principal
@@ -222,7 +282,7 @@ class Client:
                 "scheduler: no Medios-Stream-Id (call subscribe first)"
             )
         req = urllib.request.Request(
-            self._url(),
+            self._endpoint,
             data=_to_json_bytes(call),
             method="POST",
             headers=self._headers(

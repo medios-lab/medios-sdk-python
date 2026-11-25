@@ -130,7 +130,15 @@ uv run python examples/reference/main.py \
    failover_timeout=60)` and call `reconcile()` to re-learn task state. Without a
    non-zero `failover_timeout` the controller kills the framework's tasks the
    instant it disconnects.
-5. **Reading task output needs the node network-reachable.** `sandbox` reads from
+5. **Controller failover.** With more than one controller, pass every URL, as a
+   list or one comma-separated string:
+   `Client("http://ctl-a:5150,http://ctl-b:5150", ...)`. `subscribe()` finds the
+   leader, following a standby's redirect and skipping a controller that is
+   down or has no leader yet. When the stream ends, call `subscribe()` again on
+   the same client: it resubscribes as the same framework, and with a non-zero
+   `failover_timeout` the framework's tasks keep running. Then call
+   `reconcile()` to re-learn task state.
+6. **Reading task output needs the node network-reachable.** `sandbox` reads from
    `offer.hostname:node_port/files/read`; `Resolver.work_dir` must equal the
    node's `--work_dir`.
 
