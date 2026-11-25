@@ -194,7 +194,8 @@ def main() -> int:
         log.error("--principal: %s", e)
         return 2
 
-    client = Client(args.controller, "reference", user=args.user)
+    client = Client(args.controller, "reference", user=args.user,
+                    principal="framework:reference")
     framework = Framework(client, args.cpus, args.mem, args.cmd, pending=args.n,
                           principal=args.principal)
 

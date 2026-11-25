@@ -52,6 +52,7 @@ from medios_sdk import medios
 client = Client(
     "http://127.0.0.1:5150", "my-framework",
     user="alice",  # MUST be a real user on the nodes — see Notes
+    principal="framework:my-framework",  # required unless the controller authenticates frameworks
 )
 
 for event in client.subscribe():
