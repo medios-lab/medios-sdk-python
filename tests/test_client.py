@@ -352,3 +352,54 @@ def test_resubscribe_reuses_assigned_framework_id():
 def test_empty_controller_url_is_refused():
     with pytest.raises(ValueError):
         Client(" , ", "test-fw")
+
+
+class _Truncator:
+    """Answers each request with a status line, a Content-Length of ten and one
+    body byte, then closes the connection."""
+
+    def __init__(self, status, location=None):
+        head = f"HTTP/1.1 {status} X\r\nContent-Length: 10\r\n"
+        if location:
+            head += f"Location: {location}\r\n"
+        self._reply = (head + "\r\nx").encode()
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            conn.recv(65536)
+            conn.sendall(self._reply)
+            conn.close()
+
+    def close(self):
+        self._sock.close()
+
+
+def test_subscribe_skips_controller_whose_503_body_is_truncated():
+    truncator = _Truncator(503)
+    try:
+        with FakeController() as fc:
+            client = Client([truncator.url, fc.url], "test-fw")
+            client.subscribe()
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+    finally:
+        truncator.close()
+
+
+def test_subscribe_follows_redirect_whose_body_is_truncated():
+    with FakeController() as fc:
+        truncator = _Truncator(307, "//127.0.0.1:%d/api/v1/scheduler" % fc.port)
+        try:
+            client = Client(truncator.url, "test-fw")
+            client.subscribe()
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+        finally:
+            truncator.close()

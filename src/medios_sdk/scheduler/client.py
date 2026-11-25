@@ -173,8 +173,15 @@ class Client:
                     resp = self._opener.open(req)
                 except urllib.error.HTTPError as e:
                     location = e.headers.get("Location") if e.code == 307 else None
-                    detail = e.read().decode("utf-8", "replace").strip()
-                    e.close()
+                    # The status and Location header decide what happens next;
+                    # the body is only detail for the error message, so a
+                    # body cut short must not change that decision.
+                    try:
+                        detail = e.read().decode("utf-8", "replace").strip()
+                    except (http.client.HTTPException, OSError) as read_error:
+                        detail = f"(body unreadable: {type(read_error).__name__})"
+                    finally:
+                        e.close()
                     if location:
                         endpoint = urllib.parse.urljoin(endpoint, location)
                         continue
