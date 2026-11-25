@@ -52,10 +52,39 @@ _SCHEDULER_PATH = "/api/v1/scheduler"
 # moving, and subscribe() moves on to the next URL instead of chasing it.
 _MAX_REDIRECTS = 3
 
+# Default: how long one SUBSCRIBE attempt may take from connecting to the
+# response headers (and, for a non-200, to its body) before subscribe() moves
+# on to the next controller. A controller answers SUBSCRIBE with its headers
+# as soon as it has read the call, so a healthy one needs a network round
+# trip; ten seconds leaves room for a slow link and has not been measured
+# against a loaded controller. Same value as the Go SDK's
+# defaultHandshakeTimeout.
+_HANDSHAKE_TIMEOUT_S = 10.0
+
 
 class SchedulerError(Exception):
     """A call failed: a transport error, a non-2xx response, or a call made
     before :meth:`Client.subscribe`."""
+
+
+def _lift_socket_timeout(resp) -> None:
+    """Clear the handshake timeout on the socket under an open SUBSCRIBE
+    response, so reads on the event stream block until the next event.
+
+    urllib exposes no public handle on the socket; an http.client response
+    holds it at ``fp.raw._sock`` for both HTTP and HTTPS. A response without
+    one (an opener that does not use http.client) would keep the handshake
+    timeout on every stream read and end a healthy subscription between
+    heartbeats, so it is refused instead.
+    """
+    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    if sock is None or not hasattr(sock, "settimeout"):
+        raise SchedulerError(
+            "SUBSCRIBE: the response does not expose its socket, so the "
+            "handshake timeout cannot be cleared for the event stream; "
+            "use an opener built on urllib's HTTP handlers"
+        )
+    sock.settimeout(None)
 
 
 def _to_json_bytes(call: Call) -> bytes:
@@ -134,6 +163,9 @@ class Client:
         self._endpoint = ""
         self._stream_id = ""
         self._opener = opener or urllib.request.build_opener()
+        # Bounds one SUBSCRIBE attempt up to the response headers; the open
+        # stream is not bounded.
+        self._handshake_timeout = _HANDSHAKE_TIMEOUT_S
 
     @property
     def framework_id(self) -> str:
@@ -170,7 +202,11 @@ class Client:
                     ),
                 )
                 try:
-                    resp = self._opener.open(req)
+                    # urllib applies the timeout to the socket, so it bounds
+                    # the connect, the wait for headers and, on an HTTPError,
+                    # each read of the body below. It is lifted once a 200
+                    # arrives so the stream can idle between heartbeats.
+                    resp = self._opener.open(req, timeout=self._handshake_timeout)
                 except urllib.error.HTTPError as e:
                     location = e.headers.get("Location") if e.code == 307 else None
                     # The status and Location header decide what happens next;
@@ -199,6 +235,11 @@ class Client:
                     errors.append(f"{endpoint}: {type(e).__name__}: {e}")
                     break
 
+                try:
+                    _lift_socket_timeout(resp)
+                except SchedulerError:
+                    resp.close()
+                    raise
                 self._endpoint = endpoint
                 self._stream_id = resp.headers.get("Medios-Stream-Id", "") or ""
                 return self._events(resp)

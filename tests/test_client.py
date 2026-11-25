@@ -8,6 +8,7 @@ import json
 import queue
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -403,3 +404,54 @@ def test_subscribe_follows_redirect_whose_body_is_truncated():
             assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
         finally:
             truncator.close()
+
+
+class _Silent:
+    """Accepts each connection, reads the request and never answers."""
+
+    def __init__(self):
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen()
+        self._conns = []
+        self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            conn.recv(65536)
+            self._conns.append(conn)  # held open, never answered
+
+    def close(self):
+        self._sock.close()
+        for c in self._conns:
+            c.close()
+
+
+def test_subscribe_skips_controller_that_never_answers():
+    silent = _Silent()
+    try:
+        with FakeController() as fc:
+            client = Client([silent.url, fc.url], "test-fw")
+            client._handshake_timeout = 0.3
+            t0 = time.monotonic()
+            client.subscribe()
+            assert time.monotonic() - t0 < 2.0
+            assert fc.recorded()[0][1].type == m.CALL_SUBSCRIBE
+    finally:
+        silent.close()
+
+
+def test_open_stream_is_not_bounded_by_the_handshake_timeout():
+    with FakeController() as fc:
+        client = Client(fc.url, "test-fw")
+        client._handshake_timeout = 0.2
+        events = client.subscribe()
+        # Send only after the client has blocked in a read for three
+        # handshake timeouts, so a timeout left on the socket would fire.
+        threading.Timer(0.6, fc.send_event, args=(_subscribed("fw-idle"),)).start()
+        assert next(events).subscribed.framework_id.value == "fw-idle"
